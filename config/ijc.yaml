@@ -1,0 +1,41 @@
+output: data
+contact: ""
+collection_basis: ""
+user_agent: IJCPolicyResearch/0.1
+allowed_hosts: [ijc.org, www.ijc.org]
+delay_seconds: 2
+max_bytes: 262144000
+timeout_seconds: 60
+retries: 3
+robots_ttl_seconds: 86400
+max_requests: 100
+policy_url: https://www.ijc.org/en/policies
+seeds:
+  - url: https://www.ijc.org/en/boundary-waters-treaty-1909
+    name: treaty
+    expected: Boundary Waters Treaty
+  - url: https://www.ijc.org/en/who/mission
+    name: mandates
+    expected: Mission
+  - url: https://www.ijc.org/en/who/boards
+    name: active_boards
+    expected: Boards
+  - url: https://www.ijc.org/en/who/boards/completed
+    name: archived_boards
+    expected: Completed
+  - url: https://ijc.org/en/transboundary-waters
+    name: watersheds
+    expected: Transboundary Waters
+  - url: https://www.ijc.org/en/iwi-iibh/library/publications
+    name: iwi_publications
+    expected: Publications
+    listing: true
+  - url: https://www.ijc.org/en/library/reports
+    name: publications
+    expected: Publications
+    listing: true
+  - url: https://www.ijc.org/en/library/dockets
+    name: dockets
+    expected: Dockets
+    listing: true
+exclude_paths: ['/user', '/admin', '/search', '/en/search', '/fr/search']
