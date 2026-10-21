@@ -117,6 +117,47 @@ external documents are reported rather than converted or fetched.
 
 ## Resume, update, and recovery
 
+Retry state and origin pauses persist in SQLite across invocations. Page and
+attachment 404/410 responses are unavailable for the current run and are skipped
+on ordinary resume. Temporary network/429/5xx failures share a consecutive-attempt
+limit of `1 + retries` across restarts. Backoff deadlines and `Retry-After` survive
+restarts; waits longer than 60 seconds defer work instead of sleeping.
+
+A 401/403 pauses the HTTPS origin until an operator reviews the denial and
+explicitly resumes it. Robots checks still apply after resume. A paused origin
+ends the invocation without marking the remaining queue as attempted.
+
+```sh
+# After reviewing an access denial (does not make a network request):
+uv run policy-scraper --config config/ijc.yaml origin-resume --origin https://ijc.org
+# Deliberately retry one unavailable/exhausted URL; does not clear origin pauses:
+uv run policy-scraper --config config/ijc.yaml retry-reset --run-id <run-id> --url <url>
+```
+
+Migration is automatic under the CLI output lock. Stop the scraper and back up
+the complete output directory before first using this version. Recognized legacy
+404/410 failures remain unavailable; ambiguous legacy failures require an explicit
+reset. Original artifacts, reviews, run IDs, configuration hashes, and attempts
+remain intact. Embedded Windows file paths are recorded as exclusions.
+
+For a backed-up migration with invariant and artifact checks:
+
+```sh
+uv run python scripts/validate_retry_migration.py --output data --backup old_data/retry-backup-<date> --apply
+```
+
+The helper refuses an existing backup destination or a running scraper, validates
+the copied ledger twice, checks backed-up object hashes, and verifies that the
+original ledger records are unchanged by migration.
+
+Each network invocation writes `runs/<run-id>/invocation.json`, including actual
+HTTP attempts, documents added, remaining eligible attachments, unfinished
+discovery, unavailable/exhausted URLs, cooldowns, paused origins, and a stop reason.
+`continue_batch` is true only for a request-budget stop with actual HTTP attempts.
+The provided `rerun.bat` uses this flag and stops on errors, access pauses,
+interruption, exhausted eligible work, or midnight. Scrapy request counts include
+local scheduling; use the ledger HTTP-attempt counts to measure network activity.
+
 ```sh
 # Resume interrupted work with the same configuration:
 uv run policy-scraper --config config/ijc.yaml collect --run-id <run-id>

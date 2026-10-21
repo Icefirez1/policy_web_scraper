@@ -13,9 +13,16 @@ from scrapy.http import HtmlResponse, Response, XmlResponse
 from scrapy.utils.defer import maybe_deferred_to_future
 from twisted.internet.threads import deferToThread
 
-from .rules import classify, inspect_body, language, link_kind, normalize
+from .rules import classify, inspect_body, language, link_kind, local_file_link, normalize
 from .store import Store, now
-from .transport import AccessError, BudgetExceeded, Transport
+from .transport import (
+    AccessError,
+    BudgetExceeded,
+    OriginPaused,
+    PermanentHTTPError,
+    RobotsDenied,
+    Transport,
+)
 
 
 class DownloadHandler:
@@ -40,10 +47,15 @@ class DownloadHandler:
                 spider.cfg, spider.store.root / "runs" / spider.run_id / "access"
             )
         ledger = Store(spider.cfg.output)
+        self.transport.ledger = ledger
+        self.transport.run_id = spider.run_id
         self.transport.attempt = lambda url, status, detail: ledger.attempt(
             spider.run_id, url, status, detail
         )
         try:
+            if spider.halted:
+                raise BudgetExceeded("Invocation already stopped")
+            ledger.update(spider.run_id, request.meta["source_url"], state="fetching")
             result = self.transport.fetch(
                 request.url,
                 {k.decode(): b", ".join(v).decode() for k, v in request.headers.items()},
@@ -86,7 +98,9 @@ class PolicySpider(scrapy.Spider):
         "LOG_LEVEL": "INFO",
     }
 
-    def __init__(self, cfg, store, run_id, collect=False, preflight=False, known_only=False, **kwargs):
+    def __init__(
+        self, cfg, store, run_id, collect=False, preflight=False, known_only=False, **kwargs
+    ):
         super().__init__(**kwargs)
         self.cfg, self.store, self.run_id = cfg, store, run_id
         self.collect_mode, self.preflight = collect, preflight
@@ -95,6 +109,7 @@ class PolicySpider(scrapy.Spider):
         self.collection_started = False
         self.seeds = {normalize(s["url"]): s for s in cfg.seeds}
         self.page_hashes = {}
+        self.stop_reason = None
 
     @classmethod
     def from_crawler(cls, crawler, *args, **kwargs):
@@ -105,6 +120,9 @@ class PolicySpider(scrapy.Spider):
         return spider
 
     def callback_error(self, failure, response, spider):
+        self.store.set_retry(
+            self.run_id, response.meta["source_url"], code="callback_error", terminal=1
+        )
         self.store.update(
             self.run_id,
             response.meta["source_url"],
@@ -117,6 +135,10 @@ class PolicySpider(scrapy.Spider):
             self.store.add(self.run_id, self.cfg.policy_url, "policy", metadata={"seed": "policy"})
             policy = self.row(self.cfg.policy_url)
             if policy["state"] != "discovered" or not self.store.valid(policy["artifact"]):
+                if not self.store.eligible(self.run_id, self.cfg.policy_url):
+                    self.halted = True
+                    self.stop_reason = "policy_prerequisite"
+                    return
                 # Fetch the prerequisite directly instead of waiting behind discovery.
                 self.store.update(self.run_id, self.cfg.policy_url, kind="policy")
                 yield self.request(self.cfg.policy_url)
@@ -128,11 +150,14 @@ class PolicySpider(scrapy.Spider):
         for url, seed in self.seeds.items():
             self.store.add(self.run_id, url, "page", metadata={"seed": seed["name"]})
         for row in self.store.rows(self.run_id):
-            if row["kind"] in {"page", "policy", "sitemap"} and row["state"] == "pending":
+            if (
+                row["kind"] in {"page", "policy", "sitemap"}
+                and row["state"] == "pending"
+                and self.store.eligible(self.run_id, row["url"])
+            ):
                 yield self.request(row["url"])
 
     def request(self, url):
-        self.store.update(self.run_id, url, state="fetching")
         headers = {}
         latest = self.store.latest(url)
         if latest:
@@ -158,21 +183,61 @@ class PolicySpider(scrapy.Spider):
 
     def failed(self, failure):
         url = failure.request.meta["source_url"]
-        blocked = failure.check(AccessError)
+        error = failure.value
+        if getattr(error, "url", None) and error.url != url:
+            self.store.db.execute(
+                "INSERT OR IGNORE INTO retry_dependencies VALUES (?,?,?)",
+                (self.run_id, url, error.url),
+            )
+            self.store.db.commit()
+        if failure.check(BudgetExceeded):
+            self.store.update(self.run_id, url, state="pending")
+            self.halted = True
+            self.stop_reason = self.stop_reason or "request_budget"
+            self.crawler.engine.close_spider(self, self.stop_reason)
+            return
+        if failure.check(OriginPaused):
+            if not self.store.retry(self.run_id, url)["code"]:
+                self.store.set_retry(self.run_id, url, code="origin_paused", status=error.status)
+            self.halted = True
+            self.stop_reason = "origin_paused"
+            self.crawler.engine.close_spider(self, self.stop_reason)
+        if failure.check(PermanentHTTPError, RobotsDenied):
+            self.store.set_retry(
+                self.run_id,
+                url,
+                code="unavailable" if failure.check(PermanentHTTPError) else "robots_denied",
+                status=error.status,
+                terminal=1,
+            )
+        elif getattr(error, "url", None) and error.url != url:
+            retry = self.store.retry(self.run_id, error.url)
+            self.store.set_retry(
+                self.run_id, url, **{k: v for k, v in retry.items() if k not in {"run", "url"}}
+            )
+        elif type(error) is AccessError or not isinstance(error, AccessError):
+            self.store.set_retry(self.run_id, url, code="unexpected_failure", terminal=1)
+        blocked = failure.check(OriginPaused, RobotsDenied)
         self.store.update(
             self.run_id, url, state="blocked" if blocked else "failed", reason=str(failure.value)
         )
-        if failure.check(BudgetExceeded):
-            self.halted = True
-            self.crawler.engine.close_spider(self, "request_budget")
 
     def parse(self, response):
         source = response.meta["source_url"]
         row = self.row(source)
         path = Path(response.meta["download_path"])
         try:
+            if response.status in {404, 410}:
+                self.store.set_retry(
+                    self.run_id, source, code="unavailable", status=response.status, terminal=1
+                )
+                self.store.update(
+                    self.run_id, source, state="failed", reason=f"HTTP {response.status}"
+                )
+                return []
             return list(self.process(response, source, row, path))
         except (ValueError, OSError) as error:
+            self.store.set_retry(self.run_id, source, code="validation_error", terminal=1)
             self.store.update(self.run_id, source, state="failed", reason=str(error))
             return []
         finally:
@@ -395,6 +460,25 @@ class PolicySpider(scrapy.Spider):
     def discover_link(self, href, parent, label, parent_meta, sitemap=False):
         url = normalize(href, parent)
         if not url:
+            if local_file_link(href):
+                self.store.add(self.run_id, href, "page", parent, label)
+                self.store.update(
+                    self.run_id,
+                    href,
+                    state="excluded",
+                    decision="exclude",
+                    reason="Malformed local-file link",
+                )
+            return
+        if local_file_link(href) or local_file_link(url):
+            self.store.add(self.run_id, url, "page", parent, label)
+            self.store.update(
+                self.run_id,
+                url,
+                state="excluded",
+                decision="exclude",
+                reason="Malformed local-file link",
+            )
             return
         kind = "sitemap" if sitemap else link_kind(url)
         if kind == "asset":
@@ -471,7 +555,7 @@ class PolicySpider(scrapy.Spider):
                 reason=reason,
             )
             return
-        if kind in {"page", "sitemap"}:
+        if kind in {"page", "sitemap"} and self.store.eligible(self.run_id, url):
             yield self.request(url)
 
     def idle(self):
@@ -491,6 +575,7 @@ class PolicySpider(scrapy.Spider):
             self.known_only and not self.store.valid(policy["artifact"])
         ):
             self.halted = True
+            self.stop_reason = "policy_prerequisite"
             return []
         attachments = []
         for row in self.store.rows(self.run_id):
@@ -541,11 +626,38 @@ class PolicySpider(scrapy.Spider):
             if row["state"] == "discovered" and self.store.valid(row["artifact"]):
                 artifact = self.store.save((self.store.root / row["artifact"]).read_bytes(), "html")
                 self.store.update(self.run_id, row["url"], state="collected", artifact=artifact)
-            elif row["kind"] == "attachment" and row["state"] == "pending":
+            elif (
+                row["kind"] == "attachment"
+                and row["state"] == "pending"
+                and self.store.eligible(self.run_id, row["url"])
+            ):
                 attachments.append(row["url"])
         return [self.request(url) for url in attachments]
 
     def closed_run(self, reason):
+        self.store.db.execute(
+            "UPDATE urls SET state='pending' WHERE run=? AND state='fetching'", (self.run_id,)
+        )
+        metadata = json.loads(
+            self.store.db.execute(
+                "SELECT metadata FROM runs WHERE id=?", (self.run_id,)
+            ).fetchone()[0]
+        )
+        if reason == "finished" and not self.stop_reason:
+            if any(self.store.paused(f"https://{host}") for host in self.cfg.allowed_hosts):
+                self.stop_reason = "origin_paused"
+            elif any(
+                r["state"] in {"pending", "failed", "blocked"} and r["decision"] != "exclude"
+                for r in self.store.rows(self.run_id)
+            ):
+                self.stop_reason = "no_eligible_work"
+        metadata["stop_reason"] = self.stop_reason or reason
+        stats = getattr(getattr(self, "crawler", None), "stats", None)
+        if stats is not None:
+            metadata["scheduled_requests"] = stats.get_value("downloader/request_count", 0)
+        self.store.db.execute(
+            "UPDATE runs SET metadata=? WHERE id=?", (json.dumps(metadata), self.run_id)
+        )
         status = "blocked" if self.halted else "interrupted" if reason != "finished" else "finished"
         self.store.db.execute("UPDATE runs SET status=? WHERE id=?", (status, self.run_id))
         self.store.db.commit()

@@ -2,7 +2,7 @@
 
 import re
 from dataclasses import dataclass
-from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlsplit, urlunsplit
 
 TRACKING = {"fbclid", "gclid", "mc_cid", "mc_eid"}
 SUPPORTED = {".pdf", ".txt", ".html", ".htm"}
@@ -32,6 +32,17 @@ RESTRICTED = re.compile(
     r"tous droits réservés|reproduction interdite",
     re.I,
 )
+
+
+def local_file_link(url: str) -> bool:
+    value = url
+    for _ in range(3):
+        value = unquote(value)
+    return bool(
+        value.startswith(("\\\\", "file:"))
+        or re.match(r"^[A-Za-z]:[/\\]", value)
+        or re.search(r"/[A-Za-z]:[/\\]", value)
+    )
 
 
 def normalize(url: str, base: str = "") -> str | None:

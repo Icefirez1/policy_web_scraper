@@ -20,6 +20,7 @@ def test_default_seed_registry_loads():
 
 def test_preflight_requires_contact_before_network(tmp_path, monkeypatch, capsys):
     cfg = yaml.safe_load(open("config/ijc.yaml", encoding="utf-8"))
+    cfg["contact"] = ""
     cfg["output"] = str(tmp_path / "data")
     path = tmp_path / "config.yaml"
     path.write_text(yaml.safe_dump(cfg))

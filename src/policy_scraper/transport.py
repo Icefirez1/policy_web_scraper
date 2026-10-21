@@ -24,6 +24,28 @@ from .rules import normalize
 class AccessError(Exception):
     """An origin cannot be accessed under the current policy."""
 
+    def __init__(self, message, url=None, status=None):
+        super().__init__(message)
+        self.url = url
+        self.origin = Transport.origin(url) if url else None
+        self.status = status
+
+
+class OriginPaused(AccessError):
+    pass
+
+
+class PermanentHTTPError(AccessError):
+    pass
+
+
+class TemporaryFailure(AccessError):
+    pass
+
+
+class RobotsDenied(AccessError):
+    pass
+
 
 class BudgetExceeded(AccessError):
     pass
@@ -53,6 +75,8 @@ class Transport:
         self.last_request = 0.0
         self.count = 0
         self.attempt = attempt or (lambda *args: None)
+        self.ledger = None
+        self.run_id = None
 
     def close(self):
         self.client.close()
@@ -67,8 +91,10 @@ class Transport:
             raise AccessError(f"URL outside HTTPS host allowlist: {url}")
         if p.username or p.password:
             raise AccessError("Credentials in URL are prohibited")
-        if self.origin(url) in self.paused:
-            raise AccessError("Origin paused after access/robots failure")
+        if self.origin(url) in self.paused or (
+            self.ledger and self.ledger.paused(self.origin(url))
+        ):
+            raise OriginPaused("Origin paused after access/robots failure", url)
 
     @staticmethod
     def origin(url: str) -> str:
@@ -122,26 +148,75 @@ class Transport:
         return min(60, 2 ** (attempt + 1))
 
     def _request(self, url: str, headers: dict, delay: float) -> Download:
-        for attempt in range(self.cfg.retries + 1):
+        saved = self.ledger.retry(self.run_id, url) if self.ledger else {}
+        if saved.get("terminal") or saved.get("next_retry", 0) > time.time():
+            raise TemporaryFailure("Retry deferred or exhausted", url)
+        for attempt in range(saved.get("failures", 0), self.cfg.retries + 1):
             try:
                 response = self._once(url, headers, delay)
             except httpx.TransportError:
+                wait = self.retry_delay(None, attempt)
+                if self.ledger:
+                    self.ledger.set_retry(
+                        self.run_id,
+                        url,
+                        code="network",
+                        failures=attempt + 1,
+                        next_retry=time.time() + wait,
+                        terminal=int(attempt == self.cfg.retries),
+                    )
                 if attempt == self.cfg.retries:
-                    raise
-                time.sleep(self.retry_delay(None, attempt))
+                    raise TemporaryFailure("Network retries exhausted", url) from None
+                time.sleep(wait)
                 continue
             if response.status in {401, 403}:
                 self.paused.add(self.origin(url))
+                if self.ledger:
+                    self.ledger.pause(self.origin(url), "Access denied", response.status)
+                    self.ledger.set_retry(
+                        self.run_id, url, code="access_denied", status=response.status
+                    )
                 response.path.unlink(missing_ok=True)
-                raise AccessError(f"Access denied: HTTP {response.status}")
+                raise OriginPaused(f"Access denied: HTTP {response.status}", url, response.status)
             if response.status == 429 or response.status >= 500:
                 wait = self.retry_delay(response.headers.get("retry-after"), attempt)
                 response.path.unlink(missing_ok=True)
+                if self.ledger:
+                    self.ledger.set_retry(
+                        self.run_id,
+                        url,
+                        code="transient_http",
+                        status=response.status,
+                        failures=attempt + 1,
+                        next_retry=time.time() + wait,
+                        terminal=int(attempt == self.cfg.retries),
+                    )
                 if attempt == self.cfg.retries or wait > 60:
                     self.paused.add(self.origin(url))
-                    raise AccessError(f"Origin paused: HTTP {response.status}; retry after {wait}s")
+                    if self.ledger:
+                        self.ledger.pause(
+                            self.origin(url),
+                            "Temporary HTTP failure",
+                            response.status,
+                            time.time() + wait,
+                        )
+                    raise OriginPaused(
+                        f"Origin paused: HTTP {response.status}; retry after {wait}s",
+                        url,
+                        response.status,
+                    )
                 time.sleep(wait)
                 continue
+            if self.ledger:
+                self.ledger.set_retry(
+                    self.run_id,
+                    url,
+                    code=None,
+                    status=response.status,
+                    failures=0,
+                    next_retry=0,
+                    terminal=0,
+                )
             return response
         raise AssertionError("Unreachable retry state")
 
@@ -196,9 +271,18 @@ class Transport:
             delay = max(self.cfg.delay_seconds, robot_delay)
             self.robots[origin] = (time.time(), parser, delay)
             return parser, delay
-        except Exception:
-            self.paused.add(origin)
+        except BudgetExceeded:
             raise
+        except Exception as error:
+            self.paused.add(origin)
+            if self.ledger and not self.ledger.paused(origin):
+                self.ledger.pause(
+                    origin,
+                    str(error),
+                    getattr(error, "status", None),
+                    None if getattr(error, "status", None) in {401, 403} else time.time() + 60,
+                )
+            raise OriginPaused(str(error), target, getattr(error, "status", None)) from error
 
     def fetch(self, url: str, headers: dict | None = None) -> Download:
         redirects = []
@@ -206,8 +290,11 @@ class Transport:
             self.check_url(url)
             parser, delay = self.robot_policy(url)
             if not parser.can_fetch(url, self.cfg.user_agent.split("/")[0]):
-                raise AccessError("Disallowed by robots.txt")
+                raise RobotsDenied("Disallowed by robots.txt", url)
             response = self._request(url, headers or {}, delay)
+            if response.status in {404, 410}:
+                response.path.unlink(missing_ok=True)
+                raise PermanentHTTPError(f"HTTP {response.status}", url, response.status)
             if response.status not in {301, 302, 303, 307, 308}:
                 response.redirects = redirects
                 return response

@@ -104,8 +104,9 @@ def test_known_fetches_missing_policy_before_attachments(tmp_path, state):
     body = b'<html><h1>Policy</h1><a href="/new-page">Link</a></html>'
     path.write_bytes(body)
     requests[0].meta["download_path"] = str(path)
-    response = HtmlResponse(cfg.policy_url, body=body, request=requests[0],
-                            headers={"Content-Type": "text/html"})
+    response = HtmlResponse(
+        cfg.policy_url, body=body, request=requests[0], headers={"Content-Type": "text/html"}
+    )
     assert spider.parse(response) == []
     assert [r.url for r in spider.collection_requests()] == ["https://ijc.org/report.pdf"]
     assert next(r for r in store.rows(run) if r["url"].endswith("queued")) == queued
@@ -127,7 +128,10 @@ def test_known_collection_then_discovery_then_collection(tmp_path):
     def invoke(mode):
         result = subprocess.run(
             [sys.executable, "tests/fixture_crawl.py", str(tmp_path), mode],
-            capture_output=True, text=True, timeout=60, env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=env,
         )
         assert result.returncode == 0, result.stdout + result.stderr
         return json.loads((tmp_path / "fixture-result.json").read_text())
@@ -137,7 +141,7 @@ def test_known_collection_then_discovery_then_collection(tmp_path):
     assert {r["path"] for r in first["requests"]} == {"/robots.txt", "/files/report-en.pdf"}
     store = Store(str(tmp_path))
     rows = store.rows(first["run"])
-    assert next(r for r in rows if r["url"].endswith("/en/board"))["state"] == "fetching"
+    assert next(r for r in rows if r["url"].endswith("/en/board"))["state"] == "pending"
     edges = [tuple(r) for r in store.db.execute("SELECT * FROM edges")]
     second = invoke("known")
     assert second["requests"] == []
@@ -186,9 +190,19 @@ def test_reviews_and_invalid_attachment_response(tmp_path):
     store.add(run, include, "attachment")
     store.add(run, exclude, "attachment", decision="include")
     reviews = tmp_path / "reviews.jsonl"
-    reviews.write_text("\n".join(json.dumps({
-        "url": url, "decision": decision, "evidence": "Human review", "language": "en",
-    }) for url, decision in ((include, "include"), (exclude, "exclude"))))
+    reviews.write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    "url": url,
+                    "decision": decision,
+                    "evidence": "Human review",
+                    "language": "en",
+                }
+            )
+            for url, decision in ((include, "include"), (exclude, "exclude"))
+        )
+    )
     store.import_reviews(str(reviews))
     spider = PolicySpider(cfg, store, run, collect=True, known_only=True)
     requests = spider.collection_requests()
@@ -197,8 +211,9 @@ def test_reviews_and_invalid_attachment_response(tmp_path):
     body = b"<html><h1>Landing page</h1></html>"
     path.write_bytes(body)
     requests[0].meta["download_path"] = str(path)
-    response = HtmlResponse(include, body=body, request=requests[0],
-                            headers={"Content-Type": "text/html"})
+    response = HtmlResponse(
+        include, body=body, request=requests[0], headers={"Content-Type": "text/html"}
+    )
     assert spider.parse(response) == []
     assert next(r for r in store.rows(run) if r["url"] == include)["state"] == "failed"
     assert store.audit(run)["documents"] == 0
@@ -228,7 +243,8 @@ def test_cli_known_summary_exit_and_provenance(tmp_path, monkeypatch, capsys, un
     from dataclasses import asdict
 
     cfg = Config(
-        output=str(tmp_path / "data"), contact="fixture@example.org",
+        output=str(tmp_path / "data"),
+        contact="fixture@example.org",
         collection_basis="Test fixtures",
         seeds=[{"url": "https://ijc.org/saved", "name": "saved", "expected": "Directive"}],
     )
@@ -258,9 +274,18 @@ def test_cli_known_summary_exit_and_provenance(tmp_path, monkeypatch, capsys, un
             self.spider.closed_run("finished")
 
     monkeypatch.setattr("scrapy.crawler.CrawlerProcess", LocalProcess)
-    monkeypatch.setattr(sys, "argv", [
-        "policy-scraper", "--config", str(config_path), "collect-known", "--run-id", run,
-    ])
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "policy-scraper",
+            "--config",
+            str(config_path),
+            "collect-known",
+            "--run-id",
+            run,
+        ],
+    )
     if unfinished:
         with pytest.raises(SystemExit) as error:
             main()
@@ -271,4 +296,8 @@ def test_cli_known_summary_exit_and_provenance(tmp_path, monkeypatch, capsys, un
     assert "Documents added: 1; total collected: 1" in output
     assert f"unfinished discovery URLs: {int(unfinished)}" in output
     metadata = json.loads(store.db.execute("SELECT metadata FROM runs").fetchone()[0])
-    assert metadata == {**original, "last_command": "collect-known"}
+    assert metadata == {
+        **original,
+        "last_command": "collect-known",
+        "stop_reason": "no_eligible_work" if unfinished else "finished",
+    }

@@ -26,6 +26,10 @@ fixtures = Path(__file__).parent / "fixtures"
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         requests.append({"path": self.path, "validator": self.headers.get("If-None-Match")})
+        if self.path == "/a-denied.pdf":
+            self.send_response(403)
+            self.end_headers()
+            return
         pages = {
             "/robots.txt": (
                 "text/plain",
@@ -115,7 +119,34 @@ cfg = Config(
 )
 store = Store(cfg.output)
 mode = sys.argv[2] if len(sys.argv) > 2 else "collect"
-if mode == "prepare-known":
+if mode in {"retry-pause", "retry-404"}:
+    marker = root / "retry-run.txt"
+    if marker.exists():
+        run_id = store.run(cfg, marker.read_text(), known_only=True)
+    else:
+        run_id = store.run(cfg)
+        marker.write_text(run_id)
+        store.add(run_id, cfg.policy_url, "policy", decision="exclude")
+        policy = store.save(b"<html>Fixture policy</html>", "html", snapshot=True)
+        store.update(run_id, cfg.policy_url, state="discovered", artifact=policy)
+        store.add(
+            run_id,
+            "https://ijc.org/a-denied.pdf"
+            if mode == "retry-pause"
+            else "https://ijc.org/a-missing.pdf",
+            "attachment",
+            decision="include",
+        )
+        if mode == "retry-pause":
+            for index in range(100):
+                store.add(
+                    run_id, f"https://ijc.org/b-{index}.pdf", "attachment", decision="include"
+                )
+        else:
+            store.add(
+                run_id, "https://ijc.org/files/report-en.pdf", "attachment", decision="include"
+            )
+elif mode == "prepare-known":
     run_id = store.run(cfg)
     store.add(run_id, cfg.policy_url, "policy", decision="exclude")
     policy = store.save(b"<html>Fixture policy</html>", "html", snapshot=True)
@@ -130,15 +161,17 @@ if mode == "prepare-known":
         store.add(run_id, f"https://ijc.org/files/{name}.pdf", "attachment", decision=decision)
     (root / "known-run.txt").write_text(run_id)
 elif mode in {"known", "discover"}:
-    run_id = store.run(
-        cfg, (root / "known-run.txt").read_text(), known_only=mode == "known"
-    )
+    run_id = store.run(cfg, (root / "known-run.txt").read_text(), known_only=mode == "known")
 else:
     run_id = store.run(cfg)
 process = CrawlerProcess(settings={"LOG_ENABLED": False})
 process.crawl(
-    PolicySpider, cfg=cfg, store=store, run_id=run_id,
-    collect=mode != "discover", known_only=mode in {"prepare-known", "known"},
+    PolicySpider,
+    cfg=cfg,
+    store=store,
+    run_id=run_id,
+    collect=mode != "discover",
+    known_only=mode in {"prepare-known", "known", "retry-pause", "retry-404"},
 )
 process.start()
 report = store.audit(run_id)

@@ -2,7 +2,7 @@ import httpx
 import pytest
 
 from policy_scraper.config import Config
-from policy_scraper.transport import AccessError, BudgetExceeded, Transport
+from policy_scraper.transport import AccessError, BudgetExceeded, TemporaryFailure, Transport
 
 
 def transport(tmp_path, handler, **options):
@@ -119,7 +119,7 @@ def test_broken_stream_never_becomes_an_artifact(tmp_path):
             else httpx.Response(200, stream=Broken())
         ),
     )
-    with pytest.raises(httpx.ReadError):
+    with pytest.raises(TemporaryFailure):
         value.fetch("https://ijc.org/a.pdf")
     assert not list(tmp_path.glob("download-*"))
 

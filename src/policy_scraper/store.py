@@ -6,10 +6,12 @@ import json
 import os
 import sqlite3
 import subprocess
+import time
 import uuid
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from . import RULE_VERSION
 from .config import Config
@@ -53,6 +55,151 @@ class Store:
             CREATE TABLE IF NOT EXISTS latest (
                 url TEXT PRIMARY KEY, artifact TEXT, metadata TEXT);
         """)
+        self.migrate_retries()
+
+    def migrate_retries(self):
+        self.db.executescript("""
+            CREATE TABLE IF NOT EXISTS retry_state (
+                run TEXT, url TEXT, code TEXT, status INTEGER,
+                failures INTEGER DEFAULT 0, next_retry REAL DEFAULT 0,
+                terminal INTEGER DEFAULT 0, PRIMARY KEY(run,url));
+            CREATE TABLE IF NOT EXISTS origin_pauses (
+                origin TEXT PRIMARY KEY, reason TEXT, status INTEGER, until REAL);
+            CREATE TABLE IF NOT EXISTS operator_actions (
+                at TEXT, action TEXT, target TEXT);
+            CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS retry_dependencies (
+                run TEXT, source TEXT, target TEXT, PRIMARY KEY(run,source,target));
+        """)
+        if self.db.execute("SELECT 1 FROM schema_migrations WHERE name='retry-v1'").fetchone():
+            return
+        latest_access = {}
+        for attempt in self.db.execute(
+            "SELECT url,status FROM attempts WHERE status IN (200,304,401,403) ORDER BY rowid"
+        ):
+            p = urlsplit(attempt["url"])
+            latest_access[f"{p.scheme}://{p.netloc}"] = attempt["status"]
+        for row in self.db.execute(
+            "SELECT run,url,state,reason FROM urls WHERE state IN ('failed','blocked','fetching','pending') "
+            "AND NOT EXISTS (SELECT 1 FROM retry_state r WHERE r.run=urls.run AND r.url=urls.url)"
+        ).fetchall():
+            reason = row["reason"] or ""
+            permanent = reason in {"HTTP 404", "HTTP 410"}
+            budget = "budget exhausted" in reason.lower()
+            paused = "Origin paused" in reason or "Access denied" in reason
+            if row["state"] in {"fetching", "pending"} and not (permanent or budget or paused):
+                continue
+            self.db.execute(
+                "INSERT INTO retry_state VALUES (?,?,?,?,?,?,?)",
+                (
+                    row["run"],
+                    row["url"],
+                    "unavailable"
+                    if permanent
+                    else "budget"
+                    if budget
+                    else "origin_paused"
+                    if paused
+                    else "legacy_failure",
+                    int(reason[-3:]) if permanent else None,
+                    0,
+                    0,
+                    int(permanent or not (budget or paused)),
+                ),
+            )
+            if paused:
+                p = urlsplit(row["url"])
+                origin = f"{p.scheme}://{p.netloc}"
+                if latest_access.get(origin) in (401, 403):
+                    self.db.execute(
+                        "INSERT OR IGNORE INTO origin_pauses VALUES (?,?,?,NULL)",
+                        (origin, reason, latest_access[origin]),
+                    )
+        self.db.execute("INSERT INTO schema_migrations VALUES ('retry-v1')")
+        self.db.commit()
+
+    def pause(self, origin, reason, status=None, until=None):
+        self.db.execute(
+            "INSERT OR REPLACE INTO origin_pauses VALUES (?,?,?,?)", (origin, reason, status, until)
+        )
+        self.db.commit()
+
+    def paused(self, origin):
+        row = self.db.execute("SELECT * FROM origin_pauses WHERE origin=?", (origin,)).fetchone()
+        return bool(row and (row["until"] is None or row["until"] > time.time()))
+
+    def retry(self, run, url):
+        row = self.db.execute(
+            "SELECT * FROM retry_state WHERE run=? AND url=?", (run, url)
+        ).fetchone()
+        return (
+            dict(row) if row else dict(code=None, status=None, failures=0, next_retry=0, terminal=0)
+        )
+
+    def set_retry(self, run, url, **values):
+        state = self.retry(run, url)
+        state.update(values)
+        self.db.execute(
+            "INSERT OR REPLACE INTO retry_state VALUES (?,?,?,?,?,?,?)",
+            (
+                run,
+                url,
+                *(state[k] for k in ("code", "status", "failures", "next_retry", "terminal")),
+            ),
+        )
+        self.db.commit()
+
+    def eligible(self, run, url, *, mark=True):
+        from .rules import local_file_link
+
+        if local_file_link(url):
+            if mark:
+                self.update(
+                    run,
+                    url,
+                    state="excluded",
+                    decision="exclude",
+                    reason="Malformed local-file link",
+                )
+            return False
+        state = self.retry(run, url)
+        p = urlsplit(url)
+        dependencies = self.db.execute(
+            "SELECT target FROM retry_dependencies WHERE run=? AND source=?", (run, url)
+        ).fetchall()
+        return not (
+            state["terminal"]
+            or state["next_retry"] > time.time()
+            or self.paused(f"{p.scheme}://{p.netloc}")
+            or any(
+                self.retry(run, r["target"])["terminal"]
+                or self.retry(run, r["target"])["next_retry"] > time.time()
+                or self.paused(f"{urlsplit(r['target']).scheme}://{urlsplit(r['target']).netloc}")
+                for r in dependencies
+            )
+        )
+
+    def recovery(self, action, target, run=None):
+        if action == "origin-resume":
+            self.db.execute("DELETE FROM origin_pauses WHERE origin=?", (target,))
+        else:
+            row = self.db.execute(
+                "SELECT state FROM urls WHERE run=? AND url=?", (run, target)
+            ).fetchone()
+            if not row:
+                raise ValueError("Unknown run or URL")
+            if row["state"] in {"collected", "excluded", "unsupported"}:
+                raise ValueError("Cannot reset collected or excluded URLs")
+            for dependency in self.db.execute(
+                "SELECT target FROM retry_dependencies WHERE run=? AND source=?", (run, target)
+            ).fetchall():
+                self.db.execute(
+                    "DELETE FROM retry_state WHERE run=? AND url=?", (run, dependency["target"])
+                )
+            self.db.execute("DELETE FROM retry_state WHERE run=? AND url=?", (run, target))
+            self.db.execute("UPDATE urls SET state='pending' WHERE run=? AND url=?", (run, target))
+        self.db.execute("INSERT INTO operator_actions VALUES (?,?,?)", (now(), action, target))
+        self.db.commit()
 
     def run(self, cfg: Config, run_id: str | None = None, *, known_only: bool = False) -> str:
         if known_only and not run_id:
@@ -64,12 +211,21 @@ class Store:
             if known_only:
                 if json.loads(row["metadata"]).get("mode") == "preflight":
                     raise ValueError("Preflight runs cannot be used by collect-known")
-            self.db.execute(
-                "UPDATE urls SET state='pending' WHERE run=? "
-                "AND state IN ('fetching','failed','blocked')"
-                + (" AND kind='attachment'" if known_only else ""),
-                (run_id,),
-            )
+            for candidate in self.rows(run_id):
+                from .rules import local_file_link
+
+                if candidate["state"] != "collected" and local_file_link(candidate["url"]):
+                    self.eligible(run_id, candidate["url"])
+                    continue
+                if known_only and candidate["kind"] != "attachment":
+                    continue
+                if candidate["state"] in {"fetching", "failed", "blocked"} and self.eligible(
+                    run_id, candidate["url"]
+                ):
+                    self.db.execute(
+                        "UPDATE urls SET state='pending' WHERE run=? AND url=?",
+                        (run_id, candidate["url"]),
+                    )
             self.db.commit()
             return run_id
         run_id = uuid.uuid4().hex
@@ -289,6 +445,37 @@ class Store:
                 for key in ("category", "language", "board", "watershed", "seed")
             },
             "provenance": json.loads(run_row["metadata"]),
+        }
+        retry_rows = [
+            dict(r) for r in self.db.execute("SELECT * FROM retry_state WHERE run=?", (run,))
+        ]
+        report["retry_progress"] = {
+            "unavailable": sum(r["code"] == "unavailable" for r in retry_rows),
+            "exhausted_retries": sum(
+                bool(r["terminal"]) and r["code"] in {"network", "transient_http"}
+                for r in retry_rows
+            ),
+            "cooldowns": sum(r["next_retry"] > time.time() for r in retry_rows),
+            "paused_origins": [
+                dict(r)
+                for r in self.db.execute("SELECT * FROM origin_pauses")
+                if r["until"] is None or r["until"] > time.time()
+            ],
+            "unfinished_discovery": sum(
+                r["kind"] in {"page", "policy", "sitemap"}
+                and r["state"] in {"pending", "fetching", "failed", "blocked"}
+                for r in rows
+            ),
+            "eligible_attachments": sum(
+                r["kind"] == "attachment"
+                and r["state"] in {"pending", "failed", "blocked"}
+                and r["decision"] == "include"
+                and self.eligible(run, r["url"], mark=False)
+                for r in rows
+            ),
+            "cumulative_http_attempts": self.db.execute(
+                "SELECT COUNT(*) FROM attempts WHERE run=?", (run,)
+            ).fetchone()[0],
         }
         referenced = {
             r[0]
