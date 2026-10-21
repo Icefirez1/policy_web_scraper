@@ -114,9 +114,32 @@ cfg = Config(
     seeds=[{"url": "https://ijc.org/en/board", "name": "board", "expected": "Directive"}],
 )
 store = Store(cfg.output)
-run_id = store.run(cfg)
+mode = sys.argv[2] if len(sys.argv) > 2 else "collect"
+if mode == "prepare-known":
+    run_id = store.run(cfg)
+    store.add(run_id, cfg.policy_url, "policy", decision="exclude")
+    policy = store.save(b"<html>Fixture policy</html>", "html", snapshot=True)
+    store.update(run_id, cfg.policy_url, state="discovered", artifact=policy)
+    store.add(run_id, "https://ijc.org/saved", "page", decision="include")
+    saved = store.save(b"<html>Saved directive</html>", "html", snapshot=True)
+    store.update(run_id, "https://ijc.org/saved", state="discovered", artifact=saved)
+    store.add(run_id, "https://ijc.org/en/board", "page")
+    store.update(run_id, "https://ijc.org/en/board", state="fetching")
+    store.add(run_id, "https://ijc.org/files/report-en.pdf", "attachment", decision="include")
+    for name, decision in (("excluded", "exclude"), ("uncertain", "needs_review")):
+        store.add(run_id, f"https://ijc.org/files/{name}.pdf", "attachment", decision=decision)
+    (root / "known-run.txt").write_text(run_id)
+elif mode in {"known", "discover"}:
+    run_id = store.run(
+        cfg, (root / "known-run.txt").read_text(), known_only=mode == "known"
+    )
+else:
+    run_id = store.run(cfg)
 process = CrawlerProcess(settings={"LOG_ENABLED": False})
-process.crawl(PolicySpider, cfg=cfg, store=store, run_id=run_id, collect=True)
+process.crawl(
+    PolicySpider, cfg=cfg, store=store, run_id=run_id,
+    collect=mode != "discover", known_only=mode in {"prepare-known", "known"},
+)
 process.start()
 report = store.audit(run_id)
 (root / "fixture-result.json").write_text(

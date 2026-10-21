@@ -10,6 +10,7 @@ import scrapy
 from scrapy import signals
 from scrapy.exceptions import DontCloseSpider
 from scrapy.http import HtmlResponse, Response, XmlResponse
+from scrapy.utils.defer import maybe_deferred_to_future
 from twisted.internet.threads import deferToThread
 
 from .rules import classify, inspect_body, language, link_kind, normalize
@@ -18,6 +19,8 @@ from .transport import AccessError, BudgetExceeded, Transport
 
 
 class DownloadHandler:
+    lazy = True
+
     def __init__(self, crawler):
         self.crawler = crawler
         self.transport = None
@@ -26,8 +29,8 @@ class DownloadHandler:
     def from_crawler(cls, crawler):
         return cls(crawler)
 
-    def download_request(self, request, spider=None):
-        return deferToThread(self._download, request)
+    async def download_request(self, request):
+        return await maybe_deferred_to_future(deferToThread(self._download, request))
 
     def _download(self, request):
         spider = self.crawler.spider
@@ -56,7 +59,7 @@ class DownloadHandler:
             result.url, status=result.status, headers=result.headers, body=body, request=request
         )
 
-    def close(self):
+    async def close(self):
         if self.transport:
             self.transport.close()
 
@@ -83,10 +86,11 @@ class PolicySpider(scrapy.Spider):
         "LOG_LEVEL": "INFO",
     }
 
-    def __init__(self, cfg, store, run_id, collect=False, preflight=False, **kwargs):
+    def __init__(self, cfg, store, run_id, collect=False, preflight=False, known_only=False, **kwargs):
         super().__init__(**kwargs)
         self.cfg, self.store, self.run_id = cfg, store, run_id
         self.collect_mode, self.preflight = collect, preflight
+        self.known_only = known_only
         self.halted = False
         self.collection_started = False
         self.seeds = {normalize(s["url"]): s for s in cfg.seeds}
@@ -109,6 +113,17 @@ class PolicySpider(scrapy.Spider):
         )
 
     async def start(self):
+        if self.known_only:
+            self.store.add(self.run_id, self.cfg.policy_url, "policy", metadata={"seed": "policy"})
+            policy = self.row(self.cfg.policy_url)
+            if policy["state"] != "discovered" or not self.store.valid(policy["artifact"]):
+                # Fetch the prerequisite directly instead of waiting behind discovery.
+                self.store.update(self.run_id, self.cfg.policy_url, kind="policy")
+                yield self.request(self.cfg.policy_url)
+                return
+            for request in self.collection_requests():
+                yield request
+            return
         self.store.add(self.run_id, self.cfg.policy_url, "policy", metadata={"seed": "policy"})
         for url, seed in self.seeds.items():
             self.store.add(self.run_id, url, "page", metadata={"seed": seed["name"]})
@@ -462,14 +477,28 @@ class PolicySpider(scrapy.Spider):
     def idle(self):
         if self.halted or not self.collect_mode or self.collection_started:
             return
-        policy = self.row(self.cfg.policy_url)
-        if policy["state"] != "discovered":
-            self.halted = True
-            return
+        requests = self.collection_requests()
+        for request in requests:
+            self.crawler.engine.crawl(request)
+        if requests:
+            raise DontCloseSpider
+
+    def collection_requests(self):
+        """Promote snapshots first, then return only known attachment requests."""
         self.collection_started = True
-        scheduled = False
+        policy = self.row(self.cfg.policy_url)
+        if policy["state"] != "discovered" or (
+            self.known_only and not self.store.valid(policy["artifact"])
+        ):
+            self.halted = True
+            return []
+        attachments = []
         for row in self.store.rows(self.run_id):
-            if row["kind"] == "policy":
+            if row["kind"] not in {"page", "attachment"}:
+                continue
+            if row["state"] in {"unsupported", "excluded", "collected"}:
+                continue
+            if self.known_only and row["kind"] == "page" and row["state"] != "discovered":
                 continue
             meta = json.loads(row["metadata"])
             review = self.store.review(row["url"])
@@ -513,10 +542,8 @@ class PolicySpider(scrapy.Spider):
                 artifact = self.store.save((self.store.root / row["artifact"]).read_bytes(), "html")
                 self.store.update(self.run_id, row["url"], state="collected", artifact=artifact)
             elif row["kind"] == "attachment" and row["state"] == "pending":
-                self.crawler.engine.crawl(self.request(row["url"]))
-                scheduled = True
-        if scheduled:
-            raise DontCloseSpider
+                attachments.append(row["url"])
+        return [self.request(url) for url in attachments]
 
     def closed_run(self, reason):
         status = "blocked" if self.halted else "interrupted" if reason != "finished" else "finished"

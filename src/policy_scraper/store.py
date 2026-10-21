@@ -54,13 +54,20 @@ class Store:
                 url TEXT PRIMARY KEY, artifact TEXT, metadata TEXT);
         """)
 
-    def run(self, cfg: Config, run_id: str | None = None) -> str:
+    def run(self, cfg: Config, run_id: str | None = None, *, known_only: bool = False) -> str:
+        if known_only and not run_id:
+            raise ValueError("collect-known requires --run-id")
         if run_id:
             row = self.db.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
             if not row or row["config_hash"] != cfg.digest:
                 raise ValueError("Unknown run or changed configuration; start a new run")
+            if known_only:
+                if json.loads(row["metadata"]).get("mode") == "preflight":
+                    raise ValueError("Preflight runs cannot be used by collect-known")
             self.db.execute(
-                "UPDATE urls SET state='pending' WHERE run=? AND state IN ('fetching','failed','blocked')",
+                "UPDATE urls SET state='pending' WHERE run=? "
+                "AND state IN ('fetching','failed','blocked')"
+                + (" AND kind='attachment'" if known_only else ""),
                 (run_id,),
             )
             self.db.commit()

@@ -18,6 +18,11 @@ def test_local_server_collection_and_incremental_cycle(tmp_path):
             env=env,
         )
         assert result.returncode == 0, result.stdout + result.stderr
+        assert not any(
+            "policy_scraper.crawler.DownloadHandler" in line
+            for line in result.stderr.splitlines()
+            if "ScrapyDeprecationWarning" in line
+        ), result.stderr
         return json.loads((tmp_path / "fixture-result.json").read_text())
 
     first = run()

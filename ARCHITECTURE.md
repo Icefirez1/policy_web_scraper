@@ -113,6 +113,22 @@ complete discovery frontier.
 5. Leaves uncertain, restricted, foreign-language, failed, blocked, or oversized
    material in the audit output rather than treating it as collected.
 
+### `collect-known --run-id <existing-run>`
+
+1. Validates the existing run, unchanged configuration, and collection identity
+   before resetting any URL state.
+2. Resets attachment retries only; unfinished page and sitemap discovery stays
+   untouched. Records `last_command` while retaining existing mode and provenance.
+3. Fetches the configured policy page first if its snapshot is missing or invalid,
+   without following links. A failed policy fetch blocks collection.
+   Uses the shared collection phase to apply review and language decisions,
+   promote eligible HTML snapshots, and download eligible known attachments.
+   No seeds, page links, or sitemaps are traversed.
+4. Preserves successful downloads across budget stops. Subsequent invocations
+   skip collected documents; `discover --run-id <existing-run>` resumes discovery.
+5. Exports the normal audit and prints progress. Unfinished discovery can leave
+   `complete_with_gaps` and exit code 2 after a successful collection batch.
+
 ### `audit`
 
 1. Verifies that each collected artifact is present inside the output directory

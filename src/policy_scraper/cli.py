@@ -17,6 +17,8 @@ def main():
     for command in ("preflight", "discover", "collect", "audit"):
         sub = commands.add_parser(command)
         sub.add_argument("--run-id")
+    known = commands.add_parser("collect-known", help="Collect known documents without discovery")
+    known.add_argument("--run-id", required=True)
     review = commands.add_parser("review")
     review.add_argument("action", choices=["import"])
     review.add_argument("file")
@@ -37,12 +39,14 @@ def main():
                 raise ValueError("audit requires --run-id")
             report = store.audit(args.run_id)
         else:
-            cfg.validate_identity(collection=args.command == "collect")
+            known_only = args.command == "collect-known"
+            cfg.validate_identity(collection=args.command in {"collect", "collect-known"})
             from scrapy.crawler import CrawlerProcess
 
             from .crawler import PolicySpider
 
-            run_id = store.run(cfg, args.run_id)
+            run_id = store.run(cfg, args.run_id, known_only=known_only)
+            before = sum(r["state"] == "collected" for r in store.rows(run_id))
             run_metadata = json.loads(
                 store.db.execute("SELECT metadata FROM runs WHERE id=?", (run_id,)).fetchone()[0]
             )
@@ -52,7 +56,9 @@ def main():
                 and args.command != "preflight"
             ):
                 raise ValueError("Preflight runs do not traverse links; start a new discovery run")
-            run_metadata["mode"] = args.command
+            if not known_only:
+                run_metadata["mode"] = args.command
+            run_metadata["last_command"] = args.command
             store.db.execute(
                 "UPDATE runs SET metadata=?,status='running' WHERE id=?",
                 (json.dumps(run_metadata), run_id),
@@ -65,11 +71,24 @@ def main():
                 cfg=cfg,
                 store=store,
                 run_id=run_id,
-                collect=args.command == "collect",
+                collect=args.command in {"collect", "collect-known"},
+                known_only=known_only,
                 preflight=args.command == "preflight",
             )
             process.start()
             report = store.audit(run_id)
+            if known_only:
+                remaining = sum(
+                    r["kind"] in {"page", "policy", "sitemap"}
+                    and r["state"] in {"pending", "fetching", "failed", "blocked"}
+                    for r in store.rows(run_id)
+                )
+                print(
+                    f"Documents added: {report['documents'] - before}; "
+                    f"total collected: {report['documents']}; "
+                    f"unfinished discovery URLs: {remaining}."
+                )
+                print("Unfinished discovery can leave this run complete_with_gaps.")
         print(json.dumps(report, indent=2))
         if report["status"] != "complete":
             raise SystemExit(2)

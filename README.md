@@ -70,6 +70,30 @@ budget, so record cumulative request counts in `attempts.jsonl`. Do not describe
 multiple such invocations as a single 100-request pilot. To enlarge the configured
 budget or change scope, start a new run.
 
+## Collect documents before discovery finishes
+
+Use `collect-known` with an existing discovery run to save eligible HTML snapshots
+and download known eligible PDF/plain-text attachments immediately:
+
+```sh
+uv run policy-scraper --config config/ijc.yaml collect-known --run-id 4428b26f61bb41b0a928ea851a4974de
+uv run policy-scraper --config config/ijc.yaml discover --run-id 4428b26f61bb41b0a928ea851a4974de
+```
+
+Run these commands sequentially. `collect-known` leaves unfinished discovery
+queued. If the configured policy snapshot is missing or invalid, it fetches that
+page first without following its links; collection proceeds only if it succeeds.
+This prerequisite uses the same request budget. It honors reviews and
+access restrictions, skips collected documents, and uses the same request budget
+per invocation. Repeat it after a budget stop or after discovering more documents.
+Keep the configuration unchanged when resuming the same run.
+
+The command exports the normal inventory and report and prints documents added,
+total collected, and unfinished discovery URLs. Exit code 2 and
+`complete_with_gaps` can accompany a successful batch when discovery or review
+work remains. Missing or corrupt collected files are reported by the audit.
+Ordinary `collect` still performs discovery before collection.
+
 ## Review decisions and language preference
 
 Review files use one JSON object per line:

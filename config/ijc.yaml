@@ -1,6 +1,6 @@
 output: data
-contact: ""
-collection_basis: ""
+contact: "alpagar9@gmail.com"
+collection_basis: "project"
 user_agent: IJCPolicyResearch/0.1
 allowed_hosts: [ijc.org, www.ijc.org]
 delay_seconds: 2

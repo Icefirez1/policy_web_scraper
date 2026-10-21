@@ -558,7 +558,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28,<1" },
     { name = "protego", specifier = ">=0.4,<1" },
     { name = "pyyaml", specifier = ">=6,<7" },
-    { name = "scrapy", specifier = ">=2.13,<3" },
+    { name = "scrapy", specifier = ">=2.14,<3" },
 ]
 
 [package.metadata.requires-dev]
