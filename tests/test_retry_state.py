@@ -13,6 +13,7 @@ from policy_scraper.config import Config
 from policy_scraper.rules import local_file_link
 from policy_scraper.store import Store
 from policy_scraper.transport import (
+    AccessDenied,
     BudgetExceeded,
     OriginPaused,
     PermanentHTTPError,
@@ -36,7 +37,7 @@ def setup(tmp_path, handler, **options):
 
 def test_pause_survives_restart_and_requires_explicit_resume(tmp_path):
     cfg, store, run, url, transport = setup(
-        tmp_path, lambda r: httpx.Response(404 if r.url.path == "/robots.txt" else 403)
+        tmp_path, lambda r: httpx.Response(404 if r.url.path == "/robots.txt" else 401)
     )
     with pytest.raises(OriginPaused):
         transport.fetch(url)
@@ -107,7 +108,7 @@ def test_retry_success_resets_failures_and_budget_does_not_increment(tmp_path, m
     assert store.retry(run, url)["failures"] == 1
 
 
-def test_redirect_pause_records_actual_origin(tmp_path):
+def test_redirect_denial_records_actual_url(tmp_path):
     def handle(request):
         if request.url.path == "/robots.txt":
             return httpx.Response(404)
@@ -116,11 +117,15 @@ def test_redirect_pause_records_actual_origin(tmp_path):
         return httpx.Response(403)
 
     cfg, store, run, url, transport = setup(tmp_path, handle)
-    with pytest.raises(OriginPaused) as failure:
+    with pytest.raises(AccessDenied) as failure:
         transport.fetch(url)
     assert failure.value.url == "https://www.ijc.org/target.pdf"
-    assert store.paused("https://www.ijc.org")
+    assert not store.paused("https://www.ijc.org")
     assert not store.paused("https://ijc.org")
+    assert store.retry(run, failure.value.url)["terminal"]
+    transport.client.close()
+    transport.client = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200)))
+    transport.fetch("https://www.ijc.org/other.pdf").path.unlink()
 
 
 @pytest.mark.parametrize(

@@ -123,8 +123,11 @@ on ordinary resume. Temporary network/429/5xx failures share a consecutive-attem
 limit of `1 + retries` across restarts. Backoff deadlines and `Retry-After` survive
 restarts; waits longer than 60 seconds defer work instead of sleeping.
 
-A 401/403 pauses the HTTPS origin until an operator reviews the denial and
-explicitly resumes it. Robots checks still apply after resume. A paused origin
+A document HTTP 403 blocks only that URL for the current run and returns it to
+`review_required.jsonl`, even if previously approved. Other URLs continue. Use
+`retry-reset` after review to retry it. A 401 or an unusable robots policy
+(including robots HTTP 403) pauses the HTTPS origin until an operator reviews
+the denial and explicitly resumes it. Robots checks still apply after resume. A paused origin
 ends the invocation without marking the remaining queue as attempted.
 
 ```sh

@@ -35,6 +35,10 @@ class OriginPaused(AccessError):
     pass
 
 
+class AccessDenied(AccessError):
+    pass
+
+
 class PermanentHTTPError(AccessError):
     pass
 
@@ -169,7 +173,14 @@ class Transport:
                     raise TemporaryFailure("Network retries exhausted", url) from None
                 time.sleep(wait)
                 continue
-            if response.status in {401, 403}:
+            if response.status == 403:
+                if self.ledger:
+                    self.ledger.set_retry(
+                        self.run_id, url, code="access_denied", status=403, terminal=1
+                    )
+                response.path.unlink(missing_ok=True)
+                raise AccessDenied("Access denied: HTTP 403", url, 403)
+            if response.status == 401:
                 self.paused.add(self.origin(url))
                 if self.ledger:
                     self.ledger.pause(self.origin(url), "Access denied", response.status)

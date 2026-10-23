@@ -17,6 +17,7 @@ from .rules import classify, inspect_body, language, link_kind, local_file_link,
 from .store import Store, now
 from .transport import (
     AccessError,
+    AccessDenied,
     BudgetExceeded,
     OriginPaused,
     PermanentHTTPError,
@@ -195,6 +196,14 @@ class PolicySpider(scrapy.Spider):
             self.halted = True
             self.stop_reason = self.stop_reason or "request_budget"
             self.crawler.engine.close_spider(self, self.stop_reason)
+            return
+        if failure.check(AccessDenied):
+            self.store.set_retry(
+                self.run_id, url, code="access_denied", status=403, terminal=1
+            )
+            self.store.update(
+                self.run_id, url, state="blocked", decision="needs_review", reason=str(error)
+            )
             return
         if failure.check(OriginPaused):
             if not self.store.retry(self.run_id, url)["code"]:

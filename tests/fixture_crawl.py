@@ -27,7 +27,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         requests.append({"path": self.path, "validator": self.headers.get("If-None-Match")})
         if self.path == "/a-denied.pdf":
-            self.send_response(403)
+            self.send_response(401)
             self.end_headers()
             return
         pages = {

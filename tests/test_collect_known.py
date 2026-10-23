@@ -183,6 +183,31 @@ def test_known_retry_after_budget_or_interruption(tmp_path, interrupted):
     assert sum(r["state"] == "collected" for r in store.rows(run)) == 1
 
 
+def test_denied_attachment_returns_to_review_without_stopping(tmp_path):
+    from policy_scraper.transport import AccessDenied
+
+    cfg, store, run = prepared(tmp_path)
+    url = "https://ijc.org/denied.pdf"
+    other = "https://ijc.org/other.pdf"
+    store.add(run, url, "attachment", decision="include")
+    store.add(run, other, "attachment", decision="include")
+    spider = PolicySpider(cfg, store, run, collect=True, known_only=True)
+    request = next(r for r in spider.collection_requests() if r.url == url)
+    failure = Failure(AccessDenied("Access denied: HTTP 403", url, 403))
+    failure.request = request
+    spider.failed(failure)
+    assert not spider.halted
+    assert not store.eligible(run, url)
+    assert store.eligible(run, other)
+    store.audit(run)
+    reviews = [json.loads(line) for line in
+               (tmp_path / "runs" / run / "review_required.jsonl").read_text().splitlines()]
+    assert any(r["url"] == url and r["decision"] == "needs_review" for r in reviews)
+    store.run(cfg, run, known_only=True)
+    resumed = PolicySpider(cfg, store, run, collect=True, known_only=True)
+    assert url not in [r.url for r in resumed.collection_requests()]
+
+
 def test_reviews_and_invalid_attachment_response(tmp_path):
     cfg, store, run = prepared(tmp_path)
     include = "https://ijc.org/approved.pdf"
